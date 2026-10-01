@@ -30,6 +30,7 @@ import urllib.parse
 
 import nas_ssh
 import nas_utils
+from ugreen_app.backup_commands import inline_backup_command
 from ugreen_app.scroll_helpers import (
     should_ignore_smooth_mousewheel_target,
     smooth_bind_mousewheel_tree,
@@ -1977,6 +1978,7 @@ class MixinTabsSetup:
         self.backup_output.pack(fill=tk.X, expand=False, padx=10, pady=10)
 
         self._backup_log(self.t("backup.ready"), reset=True)
+        self._backup_log(self.t("backup.retention_notice"))
         self._backup_on_scope_change()
         self._backup_on_destination_change()
         self.backup_refresh_sources()
@@ -2063,28 +2065,25 @@ class MixinTabsSetup:
         exclude_globs: tuple[str, ...] = (),
         archive_parent_override: str | None = None,
     ) -> str:
-        q_sources = " ".join(shlex.quote(p) for p in self._backup_unique_ordered_paths(sources))
-        ex_args = " ".join(f"--exclude={shlex.quote(x)}" for x in exclude_globs if str(x or "").strip())
-        arc_root = str(archive_parent_override or "").strip().rstrip("/")
-        arch_base = arc_root if arc_root else ((target_volume.rstrip("/") or "/volume1"))
-        inner = (
-            "set -e;"
-            f"SOURCES=({q_sources});"
-            "SRC_OK=();"
-            "for p in \"${SOURCES[@]}\"; do [ -e \"$p\" ] && SRC_OK+=(\"$p\"); done;"
-            "if [ ${#SRC_OK[@]} -eq 0 ]; then echo '__UG_BACKUP_NO_SOURCE__'; exit 0; fi;"
-            f"DEST_DIR={shlex.quote(arch_base + '/backup/ugreen_admin')};"
-            f"TAG={shlex.quote(tag)};"
-            "mkdir -p \"$DEST_DIR\";"
-            "DEST_FILE=\"$DEST_DIR/${TAG}_$(date +%Y%m%d_%H%M%S).tar.gz\";"
-            f"tar -czf \"$DEST_FILE\" --warning=no-file-changed --ignore-failed-read {ex_args} \"${{SRC_OK[@]}}\";"
-            "echo \"__UG_BACKUP_FILE__:$DEST_FILE\";"
-            "du -h \"$DEST_FILE\" 2>/dev/null | awk '{print \"__UG_BACKUP_SIZE__:\"$1}' || true;"
-            # Pro TAG (docker_scripts / user_data_… / all_data_…) max. 2 Archive; älteste desselben Typs löschen
-            "( set +e; cd \"$DEST_DIR\" && ls -1t \"$TAG\"_*.tar.gz 2>/dev/null | awk 'NR>2' "
-            "| while IFS= read -r _UG_OLD; do [ -n \"$_UG_OLD\" ] && rm -f -- \"$_UG_OLD\"; done; true );"
-        )
-        return f"/bin/bash -lc {shlex.quote(inner)}"
+        return inline_backup_command(self._scheduled_backup_runner_template_text(), "_run_tar", {
+            "tag": tag, "sources": self._backup_unique_ordered_paths(sources),
+            "target_volume": target_volume, "excludes": list(exclude_globs),
+            "archive_parent": archive_parent_override,
+            # Home roots are candidates at initial discovery, not all mandatory.
+            "discover_sources": tag.startswith("user_data_"),
+        })
+
+    def _backup_capture_job_sources(self, jobs):
+        if not jobs:
+            return []
+        command = inline_backup_command(self._scheduled_backup_runner_template_text(), "_capture_jobs", {"jobs": jobs})
+        result = self.run_ssh_cmd_ex(command, True, update_status=False)
+        if not result.ok:
+            raise RuntimeError(result.output or "Backup source/mount verification failed")
+        captured = json.loads(result.output)
+        if not isinstance(captured, list) or len(captured) != len(jobs):
+            raise ValueError("Invalid backup source snapshot")
+        return captured
 
     def _backup_on_scope_change(self) -> None:
         mode = str(getattr(self, "var_backup_volume_scope", tk.StringVar(value="all")).get() or "all")
@@ -2305,8 +2304,13 @@ class MixinTabsSetup:
                         raise FileNotFoundError(src)
                     if not hasattr(self, "_upload_local_file_via_ssh_cat"):
                         raise RuntimeError("upload helper unavailable")
-                    tmp_remote = f"/tmp/ug_restore_{int(time.time())}.tar.gz"
-                    self.run_ssh_cmd(f"/bin/mkdir -p /tmp", True, update_status=False)
+                    temporary = self.run_ssh_cmd_ex(
+                        "mktemp /tmp/ug_restore_XXXXXXXXXXXX.tar", False, update_status=False
+                    )
+                    candidate = str(temporary.output or "").strip()
+                    if not temporary.ok or not re.fullmatch(r"/tmp/ug_restore_[A-Za-z0-9]{12}\.tar", candidate):
+                        raise RuntimeError("Restore-Upload: temporäre Datei konnte nicht angelegt werden / cannot create temporary file")
+                    tmp_remote = candidate
                     self._upload_local_file_via_ssh_cat(src, tmp_remote)
                     remote_src = tmp_remote
                 else:
@@ -2318,16 +2322,20 @@ class MixinTabsSetup:
                     f"DST={shlex.quote(dst)}; "
                     'if [ ! -f "$SRC" ]; then echo "__UG_RESTORE_NOFILE__"; exit 2; fi; '
                     'mkdir -p "$DST"; '
-                    'tar -xzf "$SRC" -C "$DST" 2>/tmp/.ug_restore_err.$$ || tar -xf "$SRC" -C "$DST" 2>/tmp/.ug_restore_err.$$; '
-                    'echo "__UG_RESTORE_DONE__"; '
-                    'rm -f /tmp/.ug_restore_err.$$ 2>/dev/null || true'
+                    # tar detects the compression from the archive. A failed
+                    # extraction must not be retried over a partially changed tree.
+                    'tar -xf "$SRC" -C "$DST"; '
+                    'echo "__UG_RESTORE_DONE__"'
                 )
-                out = str(self.run_ssh_cmd("/bin/bash -lc " + shlex.quote(inner), True, update_status=False) or "")
-                if "__UG_RESTORE_DONE__" not in out:
+                result = self.run_ssh_cmd_ex(
+                    "/bin/bash -lc " + shlex.quote(inner), True, update_status=False, long_running=True
+                )
+                out = str(result.output or "")
+                if not result.ok or "__UG_RESTORE_DONE__" not in out:
                     raise RuntimeError(out.strip() or "restore failed")
                 self.root.after(0, lambda: self._backup_log(self.t("backup.restore_done", dst=dst)))
             except Exception as e:
-                self.root.after(0, lambda: self._backup_log(self.t("backup.restore_failed", err=str(e))))
+                self.root.after(0, lambda detail=str(e): self._backup_log(self.t("backup.restore_failed", err=detail)))
             finally:
                 if tmp_remote:
                     try:
@@ -2627,6 +2635,7 @@ class MixinTabsSetup:
                 messagebox.showwarning(self.t("backup.title"), self.t("backup.dest_usb_select"))
                 return
         self._backup_log(self.t(title_key), reset=True)
+        self._backup_log(self.t("backup.retention_notice"))
         self._backup_log(self.t("backup.sources"))
         for p in src:
             self._backup_log(f"  - {p}")
@@ -2645,10 +2654,13 @@ class MixinTabsSetup:
                     exclude_globs=exclude_globs,
                     archive_parent_override=(usb_root if mode == "usb" else None),
                 )
-                out = self.run_ssh_cmd(cmd, True, update_status=False)
-                text = str(out or "")
+                result = self.run_ssh_cmd_ex(cmd, True, update_status=False, long_running=True)
+                text = str(result.output or "")
                 if "__UG_BACKUP_NO_SOURCE__" in text:
                     self.root.after(0, lambda: self._backup_log(self.t("backup.no_source")))
+                    return
+                if not result.ok:
+                    self.root.after(0, lambda detail=text: self._backup_log(self.t("backup.failed", err=detail)))
                     return
                 file_path = ""
                 file_size = ""
@@ -2692,7 +2704,7 @@ class MixinTabsSetup:
                     ),
                 )
             except Exception as e:
-                self.root.after(0, lambda: self._backup_log(self.t("backup.failed", err=str(e))))
+                self.root.after(0, lambda detail=str(e): self._backup_log(self.t("backup.failed", err=detail)))
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -2725,7 +2737,7 @@ class MixinTabsSetup:
         mode = str(getattr(self, "var_backup_volume_scope", tk.StringVar(value="all")).get() or "all")
         if mode == "single":
             pick = str(getattr(self, "var_backup_volume", tk.StringVar(value="")).get() or "").strip()
-            src_vols = [pick] if pick in volumes else volumes[:1]
+            src_vols = [pick] if pick in volumes else []
         else:
             src_vols = volumes
         src_vols = self._backup_unique_ordered_paths(src_vols)
@@ -3015,6 +3027,7 @@ class MixinTabsSetup:
         if not self._danger_gate():
             return
         self._backup_log(self.t("backup.sched.sync_start"))
+        self._backup_log(self.t("backup.retention_notice"))
 
         def worker():
             err_msg = ""
@@ -3033,13 +3046,15 @@ class MixinTabsSetup:
                 jp_show = posixpath.normpath(jp)
                 runner_show = posixpath.normpath(runner_remote)
                 jp_dir = posixpath.dirname(jp)
-                self.run_ssh_cmd("/bin/bash -lc " + shlex.quote(f"mkdir -p {jp_dir}"), True, update_status=False)
-                jobs = getattr(self, "scheduled_backup_jobs", []) or []
+                jobs = self._backup_capture_job_sources(getattr(self, "scheduled_backup_jobs", []) or [])
+                created = self.run_ssh_cmd_ex(f"mkdir -p -- {shlex.quote(jp_dir)}", True, update_status=False)
+                if not created.ok:
+                    raise RuntimeError(created.output or "Cannot create backup directory")
                 if not getattr(self, "write_root_file", None):
                     raise RuntimeError(self.t("backup.sched.writer_missing"))
                 if not self.write_root_file(runner_remote, body):
                     raise RuntimeError(self.t("backup.sched.runner_write_fail"))
-                payload = json.dumps({"version": 1, "jobs": jobs}, indent=2, ensure_ascii=False)
+                payload = json.dumps({"version": 2, "jobs": jobs}, indent=2, ensure_ascii=False)
                 if not self.write_root_file(jp, payload):
                     raise RuntimeError(self.t("backup.sched.json_write_fail"))
                 cron_path = str(getattr(self, "stable_cron_path", "/etc/cron.d/papa_jobs") or "/etc/cron.d/papa_jobs")
@@ -3090,6 +3105,7 @@ class MixinTabsSetup:
                 if err_final:
                     self._backup_log(self.t("backup.sched.sync_fail", err=err_final))
                 else:
+                    self.scheduled_backup_jobs = jobs
                     self._backup_log(self.t("backup.sched.sync_done"))
                     self._backup_log(self.t("backup.sched.sync_hint", jp=jp_final or "—", runner=rn_final or "—"))
 
