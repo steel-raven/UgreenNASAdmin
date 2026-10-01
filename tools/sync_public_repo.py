@@ -68,6 +68,8 @@ PACKAGING_FILES = frozenset(
         "create_icon.py",
         "UgreenNASAdmin.spec",
         "RUN_BUILDER.bat",
+        "build-environment.lock.json",
+        "requirements-build.lock.txt",
     }
 )
 
@@ -78,6 +80,10 @@ TOOL_FILES = frozenset(
         "build_handbook_en_pdf.py",
         "handbuch_pdf_from_md.py",
         "build_release_zip.py",
+        "release_source_guard.py",
+        "reproducible_release.py",
+        "artifact_inventory.py",
+        "secret_inventory.py",
         "sync_public_repo.py",
         "split_ugreen_manager.py",
         "secret_scan.py",
