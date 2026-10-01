@@ -322,20 +322,44 @@ class MixinTransfer:
             hint = err_s or out_s or f"exit {exit_status}"
             raise OSError(f"sudo auf dem NAS fehlgeschlagen ({exit_status}): {hint[:800]}")
 
-    def _ssh_sudo_mkdir_chown(self, ssh, remote_path):
-        """Zielordner anlegen und Besitzer = SSH-User (für SFTP-Upload)."""
+    @staticmethod
+    def _upload_directory_prepare_script(remote_path, user):
+        """Only assign ownership to directories this invocation creates.
+
+        Existing directories and their contents keep their owners and modes.
+        This does not replace a separately authorised permissions/ACL operation.
+        """
         rp = posixpath.normpath((remote_path or "").strip())
         if not rp.startswith("/") or rp == "/":
             raise ValueError(f"Ungültiger Remote-Pfad: {remote_path!r}")
-        user = self.entry_user.get()
-        inner = f"mkdir -p {shlex.quote(rp)} && chown -R {shlex.quote(user)}:{shlex.quote(user)} {shlex.quote(rp)}"
-        self._ssh_sudo_bash(ssh, inner)
+        user = str(user or "").strip()
+        if not user:
+            raise ValueError("SSH-Benutzer fehlt")
+        return (
+            "set -e; "
+            f"UG_REST={shlex.quote(rp.lstrip('/'))}; UG_OWNER={shlex.quote(user)}; UG_CURRENT=''; "
+            'while [ -n "$UG_REST" ]; do '
+            'UG_PART=${UG_REST%%/*}; '
+            'if [ "$UG_REST" = "$UG_PART" ]; then UG_REST=""; else UG_REST=${UG_REST#*/}; fi; '
+            'UG_CURRENT="$UG_CURRENT/$UG_PART"; '
+            'if [ -L "$UG_CURRENT" ]; then echo "Upload directory is a symbolic link: $UG_CURRENT" >&2; exit 1; fi; '
+            'if [ -e "$UG_CURRENT" ]; then '
+            '  if [ ! -d "$UG_CURRENT" ]; then echo "Upload path is not a directory: $UG_CURRENT" >&2; exit 1; fi; '
+            'else '
+            '  mkdir -- "$UG_CURRENT"; '
+            '  chown -h -- "$UG_OWNER:" "$UG_CURRENT"; '
+            'fi; done'
+        )
+
+    def _ssh_sudo_mkdir_chown(self, ssh, remote_path):
+        """Neue Upload-Ordner anlegen; bestehende Eigentümer nicht verändern."""
+        self._ssh_sudo_bash(ssh, self._upload_directory_prepare_script(remote_path, self.entry_user.get()))
 
     def _ssh_sudo_exec_standalone(self, inner_bash_script):
         """Eigene SSH-Verbindung — nie dieselbe Session wie SFTP (sonst oft „Socket is closed“)."""
         pk = _paramiko()
         ssh = pk.SSHClient()
-        ssh.set_missing_host_key_policy(pk.AutoAddPolicy())
+        nas_ssh.configure_host_key_verification(ssh, pk)
         try:
             ssh.connect(
                 self.entry_ip.get(),
@@ -350,12 +374,7 @@ class MixinTransfer:
                 pass
 
     def _ssh_sudo_mkdir_chown_standalone(self, remote_path):
-        rp = posixpath.normpath((remote_path or "").strip())
-        if not rp.startswith("/") or rp == "/":
-            raise ValueError(f"Ungültiger Remote-Pfad: {remote_path!r}")
-        user = self.entry_user.get()
-        inner = f"mkdir -p {shlex.quote(rp)} && chown -R {shlex.quote(user)}:{shlex.quote(user)} {shlex.quote(rp)}"
-        self._ssh_sudo_exec_standalone(inner)
+        self._ssh_sudo_exec_standalone(self._upload_directory_prepare_script(remote_path, self.entry_user.get()))
 
     def _ssh_unzip_bundle_on_nas(self, remote_zip, dest_dir):
         """ZIP per sudo entpacken: unzip → busybox → python3/python (UGREEN hat oft kein unzip)."""
@@ -420,7 +439,7 @@ class MixinTransfer:
             raise ValueError(f"Ungültiger Remote-Pfad: {remote_path!r}")
         pk = _paramiko()
         ssh = pk.SSHClient()
-        ssh.set_missing_host_key_policy(pk.AutoAddPolicy())
+        nas_ssh.configure_host_key_verification(ssh, pk)
         ssh.connect(
             self.entry_ip.get(),
             **self._ssh_connect_kwargs(
@@ -938,7 +957,7 @@ class MixinTransfer:
                     time.sleep(pause_close)
                 pk = _paramiko()
                 ssh = pk.SSHClient()
-                ssh.set_missing_host_key_policy(pk.AutoAddPolicy())
+                nas_ssh.configure_host_key_verification(ssh, pk)
                 ssh.connect(
                     self.entry_ip.get(),
                     **self._ssh_connect_kwargs(
@@ -1260,7 +1279,7 @@ class MixinTransfer:
                         elif uploaded_meta:
                             pkv = _paramiko()
                             sshv = pkv.SSHClient()
-                            sshv.set_missing_host_key_policy(pkv.AutoAddPolicy())
+                            nas_ssh.configure_host_key_verification(sshv, pkv)
                             sshv.connect(
                                 self.entry_ip.get(),
                                 **self._ssh_connect_kwargs(
@@ -1478,7 +1497,7 @@ class MixinTransfer:
                     time.sleep(0.12)
                 pk = _paramiko()
                 ssh = pk.SSHClient()
-                ssh.set_missing_host_key_policy(pk.AutoAddPolicy())
+                nas_ssh.configure_host_key_verification(ssh, pk)
                 ssh.connect(
                     self.entry_ip.get(),
                     **self._ssh_connect_kwargs(

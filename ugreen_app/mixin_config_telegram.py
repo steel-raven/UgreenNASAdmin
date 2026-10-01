@@ -229,6 +229,11 @@ class MixinConfigTelegram:
         d["port"] = self.entry_port.get().strip() if hasattr(self, "entry_port") else d.get("port", "22")
         d["user"] = self.entry_user.get().strip() if hasattr(self, "entry_user") else d.get("user", "")
         d["password"] = self.entry_pwd.get() if hasattr(self, "entry_pwd") else d.get("password", "")
+        vault_value = getattr(self, "_connection_vault_value", None)
+        if vault_value == (d["ip"].strip(), d["user"].strip(), d["password"]):
+            # The entry needs the secret for authentication, but a value read
+            # from (or just saved to) the vault must not return to plain JSON.
+            d["password"] = ""
         d["ssh_use_key"] = bool(self.var_ssh_use_key.get()) if hasattr(self, "var_ssh_use_key") else d.get("ssh_use_key", False)
         d["ssh_key_path"] = self.entry_ssh_key_path.get().strip() if hasattr(self, "entry_ssh_key_path") else d.get("ssh_key_path", "")
         d["ssh_key_passphrase"] = self.entry_ssh_key_pass.get() if hasattr(self, "entry_ssh_key_pass") else d.get("ssh_key_passphrase", "")
@@ -241,6 +246,7 @@ class MixinConfigTelegram:
     def _connection_apply_profile_to_ui(self, prof):
         if not hasattr(self, "entry_ip"):
             return
+        self._connection_vault_value = None
         self.entry_ip.delete(0, tk.END)
         self.entry_ip.insert(0, str(prof.get("ip") or ""))
         self.entry_port.delete(0, tk.END)
@@ -253,6 +259,7 @@ class MixinConfigTelegram:
             kr = keyring_helper.get_ssh_password(str(prof["ip"]).strip(), str(prof["user"]).strip())
             if kr:
                 pw = kr
+                self._connection_vault_value = (str(prof["ip"]).strip(), str(prof["user"]).strip(), pw)
         self.entry_pwd.insert(0, pw)
         if hasattr(self, "var_ssh_use_key"):
             self.var_ssh_use_key.set(bool(prof.get("ssh_use_key", False)))
@@ -502,6 +509,7 @@ class MixinConfigTelegram:
             messagebox.showinfo(self.t("msg.connection"), self.t("keyring.need_host"))
             return
         if keyring_helper.set_ssh_password(host, user, pwd):
+            self._connection_vault_value = (host, user, pwd)
             messagebox.showinfo(self.t("msg.connection"), self.t("keyring.stored"))
             self.set_status(self.t("keyring.stored"))
         else:
@@ -957,7 +965,7 @@ class MixinConfigTelegram:
             "ugos_api": {
                 "port": 9443,
                 "use_https": True,
-                "verify_ssl": False,
+                "verify_ssl": True,
                 "dashboard_live": True,
             },
             "ssh": {
@@ -1519,7 +1527,7 @@ class MixinConfigTelegram:
 from __future__ import annotations
 import argparse, json, os, shlex, smtplib, ssl, subprocess, sys, time, urllib.parse, urllib.request
 from email.mime.text import MIMEText
-DEFAULT_CONFIG = "/volume1/scripts/ugreen_script_notify_config.json"
+DEFAULT_CONFIG = "/var/lib/ugreen-nas-admin/ugreen_script_notify_config.json"
 def _read_json(path):
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -1600,10 +1608,10 @@ if __name__ == "__main__":
         return src.encode("utf-8")
 
     def _script_notify_runner_remote_path(self) -> str:
-        return "/volume1/scripts/ugreen_script_notify_runner.py"
+        return "/var/lib/ugreen-nas-admin/ugreen_script_notify_runner.py"
 
     def _script_notify_runner_remote_cfg_path(self) -> str:
-        return "/volume1/scripts/ugreen_script_notify_config.json"
+        return "/var/lib/ugreen-nas-admin/ugreen_script_notify_config.json"
 
     def _script_notify_nas_cfg_from_settings(self, cfg: dict) -> dict:
         tg = dict(cfg.get("telegram") or {})
@@ -1644,10 +1652,6 @@ if __name__ == "__main__":
             runner_b = self._script_notify_runner_fallback_bytes()
         cfg_obj = self._script_notify_nas_cfg_from_settings(cfg)
         cfg_b = (json.dumps(cfg_obj, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
-        try:
-            self.run_ssh_cmd("mkdir -p /volume1/scripts", True, update_status=False)
-        except Exception:
-            pass
         ok1, err1 = self._ssh_mgr.write_remote_file_sudo(
             host, user, pwd, runner_b, self._script_notify_runner_remote_path(), chmod_mode="755", **self._ssh_auth_payload()
         )
@@ -1785,7 +1789,7 @@ if __name__ == "__main__":
                 else True,
                 "verify_ssl": bool(self.var_settings_ugos_api_verify_ssl.get())
                 if hasattr(self, "var_settings_ugos_api_verify_ssl")
-                else False,
+                else True,
             },
             "ssh": {
                 "cmd_timeout_sec": max(
@@ -2120,7 +2124,7 @@ if __name__ == "__main__":
         if hasattr(self, "var_settings_ugos_api_https"):
             self.var_settings_ugos_api_https.set(bool(ua.get("use_https", True)))
         if hasattr(self, "var_settings_ugos_api_verify_ssl"):
-            self.var_settings_ugos_api_verify_ssl.set(bool(ua.get("verify_ssl", False)))
+            self.var_settings_ugos_api_verify_ssl.set(bool(ua.get("verify_ssl", True)))
         sh = dict(cfg.get("ssh") or {})
         if hasattr(self, "entry_settings_ssh_cmd_timeout"):
             self.entry_settings_ssh_cmd_timeout.delete(0, tk.END)

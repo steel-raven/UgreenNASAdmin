@@ -4,17 +4,50 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import io
 import os
 import posixpath
+import re
 import shlex
 import threading
 import uuid
 from dataclasses import dataclass
 from typing import Callable, Optional
 import time
+from ugreen_app.root_runtime import ROOT_RUNTIME_DIR, private_runtime_directory_code
 
 _paramiko_mod = None
+
+
+def _atomic_root_write_code(path: str, mode: int, data_code: str) -> str:
+    """Remote Python: publish a new root-owned inode only after a complete write.
+
+    Bundled helpers use a checked private directory. Other callers still need
+    trusted parent directories; a file's owner cannot prevent parent replacement.
+    """
+    if path.startswith(ROOT_RUNTIME_DIR + "/") and posixpath.dirname(path) != ROOT_RUNTIME_DIR:
+        raise ValueError("Bundled helper files must be direct children of the private runtime directory")
+    return (
+        "import base64,hashlib,os,stat,tempfile\n"
+        + (private_runtime_directory_code() if path.startswith(ROOT_RUNTIME_DIR + "/") else "")
+        + data_code + "\n"
+        + f"target = {path!r}\n"
+        "if os.path.islink(target):\n"
+        "    raise ValueError('Refusing symbolic-link destination')\n"
+        "fd, temporary = tempfile.mkstemp(prefix='.ugreen-root-', dir=os.path.dirname(target))\n"
+        "try:\n"
+        "    with os.fdopen(fd, 'wb') as output:\n"
+        "        output.write(data)\n"
+        "        output.flush()\n"
+        "        os.fsync(output.fileno())\n"
+        "        os.fchown(output.fileno(), 0, 0)\n"
+        + f"        os.fchmod(output.fileno(), {mode})\n"
+        "    os.replace(temporary, target)\n"
+        "finally:\n"
+        "    if os.path.exists(temporary):\n"
+        "        os.unlink(temporary)\n"
+    )
 
 
 def _paramiko():
@@ -24,6 +57,31 @@ def _paramiko():
 
         _paramiko_mod = p
     return _paramiko_mod
+
+
+def configure_host_key_verification(ssh, pk) -> None:
+    """Use the user's OpenSSH trust store; never learn server keys implicitly."""
+    known_hosts = os.path.expanduser("~/.ssh/known_hosts")
+    # A missing store means no trusted hosts yet. Unreadable/malformed existing
+    # stores must fail closed instead of silently disabling verification.
+    try:
+        ssh.load_system_host_keys(known_hosts)
+    except FileNotFoundError:
+        pass
+
+    class RequireKnownHost(pk.MissingHostKeyPolicy):
+        def missing_host_key(self, client, hostname, key):
+            fingerprint = base64.b64encode(hashlib.sha256(key.asbytes()).digest()).decode("ascii").rstrip("=")
+            raise pk.SSHException(
+                f"Unbekannter SSH-Server / Unknown SSH server: {hostname}\n"
+                f"{key.get_name()} SHA256:{fingerprint}\n"
+                "Server-Fingerprint über einen unabhängigen, vertrauenswürdigen Weg prüfen. "
+                "Erst danach mit OpenSSH verbinden und den geprüften Schlüssel bestätigen.\n"
+                "Verify the fingerprint independently, then accept that verified key using OpenSSH.\n"
+                f"Trust store: {known_hosts}"
+            )
+
+    ssh.set_missing_host_key_policy(RequireKnownHost())
 
 
 def _decode_out(data: bytes) -> str:
@@ -140,7 +198,7 @@ class SSHManager:
             self._client = None
         pk = _paramiko()
         ssh = pk.SSHClient()
-        ssh.set_missing_host_key_policy(pk.AutoAddPolicy())
+        configure_host_key_verification(ssh, pk)
         conn_kwargs = {
             "username": user,
             "password": password,
@@ -398,17 +456,14 @@ class SSHManager:
         rp_final: str,
         chmod_mode: str,
     ) -> tuple[bool, str]:
-        """Ohne SFTP: sudo python3 schreibt Datei (Base64). Für NAS ohne schreibbares SFTP-Ziel."""
+        """Ohne SFTP: denselben atomaren Root-Schreibweg mit Base64 verwenden."""
         b64 = base64.b64encode(local_bytes).decode("ascii")
-        try:
-            mode_oct = int(str(chmod_mode).strip(), 8)
-        except ValueError:
-            mode_oct = 0o644
-        rp = rp_final.strip()
-        py_code = (
-            f"import base64,os; p={rp!r}; data=base64.b64decode({b64!r}); "
-            f"open(p,'wb').write(data); os.chmod(p,{mode_oct})"
+        py_code = _atomic_root_write_code(
+            rp_final, int(chmod_mode, 8), f"data = base64.b64decode({b64!r}, validate=True)"
         )
+        return self._exec_root_write_code(password, py_code)
+
+    def _exec_root_write_code(self, password: str, py_code: str) -> tuple[bool, str]:
         cmd = f"sudo -S /usr/bin/python3 -c {shlex.quote(py_code)}"
         stdin, stdout, stderr = self._client.exec_command(cmd)
         stdin.write((password or "") + "\n")
@@ -439,8 +494,18 @@ class SSHManager:
         ssh_key_path: str = "",
         ssh_key_passphrase: str = "",
     ) -> tuple[bool, str]:
-        """SFTP-Staging (relativ / $HOME / /tmp) + sudo mv, oder Fallback ohne SFTP (Base64 + sudo python3)."""
+        """Datei atomar als root veröffentlichen; SFTP-Staging oder Base64-Fallback.
+
+        Bereits vorhandene Symlink-Ziele werden abgelehnt. Die Elternverzeichnisse
+        müssen für root-ausgeführte Skripte zusätzlich gegen Austausch geschützt sein.
+        """
         rp_final = remote_final_path.strip()
+        mode = str(chmod_mode).strip()
+        if not posixpath.isabs(rp_final) or rp_final == "/" or "\x00" in rp_final:
+            return False, "Absolute remote file path required"
+        if not re.fullmatch(r"0?[0-7]{3}", mode):
+            return False, "Invalid file mode (expected 000 through 777)"
+        chmod_mode = mode
         with self._lock:
             try:
                 self._ensure_client(
@@ -468,10 +533,14 @@ class SSHManager:
                     )
                 try:
                     for cand in candidates:
+                        created = False
                         try:
-                            fh = sftp.file(cand, "wb")
-                            fh.write(local_bytes)
-                            fh.close()
+                            # Never overwrite a pre-existing staging path. Apply
+                            # private permissions before writing any credentials.
+                            with sftp.file(cand, "wx") as fh:
+                                created = True
+                                fh.chmod(0o600)
+                                fh.write(local_bytes)
                             if cand.startswith("/"):
                                 tmp_abs = cand
                             else:
@@ -485,6 +554,11 @@ class SSHManager:
                                     tmp_abs = posixpath.join(home, cand)
                             break
                         except OSError:
+                            if created:
+                                try:
+                                    sftp.remove(cand)
+                                except OSError:
+                                    pass
                             continue
                 finally:
                     try:
@@ -497,25 +571,29 @@ class SSHManager:
                         password, local_bytes, rp_final, chmod_mode
                     )
 
-                inner = (
-                    f"mv {shlex.quote(tmp_abs)} {shlex.quote(rp_final)} "
-                    f"&& chmod {shlex.quote(str(chmod_mode))} {shlex.quote(rp_final)}"
+                data_code = (
+                    f"source_fd = os.open({tmp_abs!r}, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)\n"
+                    "with os.fdopen(source_fd, 'rb') as source:\n"
+                    "    if not stat.S_ISREG(os.fstat(source.fileno()).st_mode):\n"
+                    "        raise ValueError('Staging source is not a regular file')\n"
+                    + f"    data = source.read({len(local_bytes) + 1})\n"
+                    + f"if hashlib.sha256(data).hexdigest() != {hashlib.sha256(local_bytes).hexdigest()!r}:\n"
+                    "    raise ValueError('Staging content changed or upload incomplete')"
                 )
-                full = f"sudo -S bash -lc {quote_remote_bash_lc(inner)}"
-                stdin, stdout, stderr = self._client.exec_command(full)
-                stdin.write((password or "") + "\n")
-                stdin.flush()
                 try:
-                    stdin.channel.shutdown_write()
-                except Exception:
-                    pass
-                out_b = stdout.read() or b""
-                err_b = stderr.read() or b""
-                code = stdout.channel.recv_exit_status()
-                msg = (_decode_out(out_b) + _decode_out(err_b)).strip()
-                if code != 0:
-                    return False, msg or f"exit {code}"
-                return True, ""
+                    return self._exec_root_write_code(
+                        password, _atomic_root_write_code(rp_final, int(mode, 8), data_code)
+                    )
+                finally:
+                    # Only remove our exclusive staging file, never the target.
+                    try:
+                        cleanup_sftp = self._client.open_sftp()
+                        try:
+                            cleanup_sftp.remove(cand)
+                        finally:
+                            cleanup_sftp.close()
+                    except Exception:
+                        pass
             except Exception as e:
                 try:
                     self.close()
