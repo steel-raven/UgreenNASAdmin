@@ -55,6 +55,7 @@ DOC_FILES = frozenset(
         "ISOLATED_RESTORE_DE.md",
         "BACKUP_RESTORE_CONTRACT_DE.md",
         "UPLOAD_METADATA_DE.md",
+        "PUBLIC_RELEASE_BINDING_DE.md",
         "RELEASE_SECURITY_REVIEW_DE.md",
     }
 )
@@ -148,6 +149,7 @@ SENSITIVE_UGREEN_FILES = frozenset(
 PUBLIC_TEST_FILES = frozenset(
     {
         "run_offline_suite.py",
+        "test_public_release_binding.py",
         "test_private_runtime.py",
         "test_shell_safety.py",
         "test_ssh_host_keys.py",
