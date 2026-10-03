@@ -56,6 +56,7 @@ DOC_FILES = frozenset(
         "BACKUP_RESTORE_CONTRACT_DE.md",
         "UPLOAD_METADATA_DE.md",
         "PUBLIC_RELEASE_BINDING_DE.md",
+        "NAS_ACCEPTANCE_DE.md",
         "RELEASE_SECURITY_REVIEW_DE.md",
     }
 )
@@ -185,6 +186,7 @@ PUBLIC_TEST_FILES = frozenset(
         "test_scheduled_backup_cron.py",
         "test_backup_preflight.py",
         "test_backup_restore_contract.py",
+        "test_backup_consistency.py",
         "test_backup_failures.py",
         "test_backup_restore_errors.py",
         "test_backup_archive_preservation.py",
